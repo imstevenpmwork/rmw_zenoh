@@ -32,6 +32,8 @@
 
 #include "rmw/rmw.h"
 
+#include "rosidl_runtime_c/type_hash.h"
+
 #include "event.hpp"
 #include "graph_cache.hpp"
 #include "message_type_support.hpp"
@@ -43,6 +45,9 @@
 class rmw_context_impl_s final
 {
 public:
+  // Enclave, name used to find security artifacts in a sros2 keystore.
+  char * enclave;
+
   // An owned session.
   z_owned_session_t session;
 
@@ -106,6 +111,7 @@ public:
   // Type support fields
   const void * type_support_impl;
   const char * typesupport_identifier;
+  const rosidl_type_hash_t * type_hash;
   MessageTypeSupport * type_support;
 
   // Context for memory allocation for messages.
@@ -171,14 +177,13 @@ public:
 
   const void * type_support_impl;
   const char * typesupport_identifier;
+  const rosidl_type_hash_t * type_hash;
   MessageTypeSupport * type_support;
   rmw_context_t * context;
 
-  void attach_condition(std::condition_variable * condition_variable);
+  bool queue_has_data_and_attach_condition_if_not(std::condition_variable * condition_variable);
 
-  void detach_condition();
-
-  bool message_queue_is_empty() const;
+  bool detach_condition_and_queue_is_empty();
 
   std::unique_ptr<saved_msg_data> pop_next_message();
 
@@ -242,16 +247,15 @@ public:
   const void * request_type_support_impl;
   const void * response_type_support_impl;
   const char * typesupport_identifier;
+  const rosidl_type_hash_t * type_hash;
   RequestTypeSupport * request_type_support;
   ResponseTypeSupport * response_type_support;
 
   rmw_context_t * context;
 
-  bool query_queue_is_empty() const;
+  bool queue_has_data_and_attach_condition_if_not(std::condition_variable * condition_variable);
 
-  void attach_condition(std::condition_variable * condition_variable);
-
-  void detach_condition();
+  bool detach_condition_and_queue_is_empty();
 
   std::unique_ptr<ZenohQuery> pop_next_query();
 
@@ -313,6 +317,7 @@ public:
   const void * request_type_support_impl;
   const void * response_type_support_impl;
   const char * typesupport_identifier;
+  const rosidl_type_hash_t * type_hash;
   RequestTypeSupport * request_type_support;
   ResponseTypeSupport * response_type_support;
 
@@ -324,11 +329,9 @@ public:
 
   void add_new_reply(std::unique_ptr<rmw_zenoh_cpp::ZenohReply> reply);
 
-  bool reply_queue_is_empty() const;
+  bool queue_has_data_and_attach_condition_if_not(std::condition_variable * condition_variable);
 
-  void attach_condition(std::condition_variable * condition_variable);
-
-  void detach_condition();
+  bool detach_condition_and_queue_is_empty();
 
   std::unique_ptr<rmw_zenoh_cpp::ZenohReply> pop_next_reply();
 

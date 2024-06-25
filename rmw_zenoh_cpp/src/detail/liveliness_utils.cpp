@@ -50,9 +50,11 @@ NodeInfo::NodeInfo(
 TopicInfo::TopicInfo(
   std::string name,
   std::string type,
+  std::string type_hash,
   rmw_qos_profile_t qos)
 : name_(std::move(name)),
   type_(std::move(type)),
+  type_hash_(std::move(type_hash)),
   qos_(std::move(qos))
 {
   // Do nothing.
@@ -70,10 +72,12 @@ enum KeyexprIndex
   Nid,
   Id,
   EntityStr,
+  Enclave,
   Namespace,
   NodeName,
   TopicName,
   TopicType,
+  TopicTypeHash,
   TopicQoS
 };
 
@@ -263,6 +267,7 @@ Entity::Entity(
   // An empty namespace from rcl will contain "/" but zenoh does not allow keys with "//".
   // Hence we mangle the empty namespace such that splitting the key
   // will always result in 5 parts.
+  keyexpr_parts[KeyexprIndex::Enclave] = mangle_name(node_info_.enclave_);
   keyexpr_parts[KeyexprIndex::Namespace] = mangle_name(node_info_.ns_);
   keyexpr_parts[KeyexprIndex::NodeName] = mangle_name(node_info_.name_);
   // If this entity has a topic info, append it to the token.
@@ -270,6 +275,7 @@ Entity::Entity(
     const auto & topic_info = this->topic_info_.value();
     keyexpr_parts[KeyexprIndex::TopicName] = mangle_name(topic_info.name_);
     keyexpr_parts[KeyexprIndex::TopicType] = mangle_name(topic_info.type_);
+    keyexpr_parts[KeyexprIndex::TopicTypeHash] = mangle_name(topic_info.type_hash_);
     keyexpr_parts[KeyexprIndex::TopicQoS] = qos_to_keyexpr(topic_info.qos_);
   }
 
@@ -336,14 +342,16 @@ std::shared_ptr<Entity> Entity::make(const std::string & keyexpr)
   if (parts.size() < KEYEXPR_INDEX_MIN + 1) {
     RCUTILS_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
-      "Received invalid liveliness token");
+      "Received invalid liveliness token with %lu/%d parts: %s",
+      parts.size(),
+      KEYEXPR_INDEX_MIN + 1, keyexpr.c_str());
     return nullptr;
   }
   for (const std::string & p : parts) {
     if (p.empty()) {
       RCUTILS_LOG_ERROR_NAMED(
         "rmw_zenoh_cpp",
-        "Received invalid liveliness token");
+        "Received invalid liveliness token with empty parts: %s", keyexpr.c_str());
       return nullptr;
     }
   }
@@ -371,6 +379,7 @@ std::shared_ptr<Entity> Entity::make(const std::string & keyexpr)
   std::string & zid = parts[KeyexprIndex::Zid];
   std::string & nid = parts[KeyexprIndex::Nid];
   std::string & id = parts[KeyexprIndex::Id];
+  std::string enclave = demangle_name(std::move(parts[KeyexprIndex::Enclave]));
   std::string ns = demangle_name(std::move(parts[KeyexprIndex::Namespace]));
   std::string node_name = demangle_name(std::move(parts[KeyexprIndex::NodeName]));
   std::optional<TopicInfo> topic_info = std::nullopt;
@@ -393,6 +402,7 @@ std::shared_ptr<Entity> Entity::make(const std::string & keyexpr)
     topic_info = TopicInfo{
       demangle_name(std::move(parts[KeyexprIndex::TopicName])),
       demangle_name(std::move(parts[KeyexprIndex::TopicType])),
+      demangle_name(std::move(parts[KeyexprIndex::TopicTypeHash])),
       std::move(qos.value())
     };
   }
@@ -403,7 +413,7 @@ std::shared_ptr<Entity> Entity::make(const std::string & keyexpr)
         std::move(nid),
         std::move(id),
         std::move(entity_type),
-        NodeInfo{std::move(domain_id), std::move(ns), std::move(node_name), ""},
+        NodeInfo{std::move(domain_id), std::move(ns), std::move(node_name), std::move(enclave)},
         std::move(topic_info)});
 }
 

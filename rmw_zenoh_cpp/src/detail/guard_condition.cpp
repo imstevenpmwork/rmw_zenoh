@@ -40,29 +40,28 @@ void GuardCondition::trigger()
 }
 
 ///=============================================================================
-void GuardCondition::attach_condition(std::condition_variable * condition_variable)
+bool GuardCondition::check_and_attach_condition_if_not(std::condition_variable * condition_variable)
 {
   std::lock_guard<std::mutex> lock(internal_mutex_);
+  if (has_triggered_) {
+    return true;
+  }
   condition_variable_ = condition_variable;
+
+  return false;
 }
 
 ///=============================================================================
-void GuardCondition::detach_condition()
+bool GuardCondition::detach_condition_and_trigger_set()
 {
   std::lock_guard<std::mutex> lock(internal_mutex_);
   condition_variable_ = nullptr;
-}
 
-///=============================================================================
-bool GuardCondition::get_and_reset_trigger()
-{
-  std::lock_guard<std::mutex> lock(internal_mutex_);
   bool ret = has_triggered_;
 
-  // There is no data associated with the guard condition, so as soon as the callers asks about the
-  // state, we can immediately reset and get ready for the next trigger.
   has_triggered_ = false;
 
   return ret;
 }
+
 }  // namespace rmw_zenoh_cpp

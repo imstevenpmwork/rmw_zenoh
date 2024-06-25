@@ -69,21 +69,47 @@
 
 namespace
 {
+//==============================================================================
+// Helper function to create a copy of a string after removing any
+// leading or trailing slashes.
+std::string strip_slashes(const char * const str)
+{
+  std::string ret = std::string(str);
+  const std::size_t len = strlen(str);
+  std::size_t start = 0;
+  std::size_t end = len - 1;
+  if (str[0] == '/') {
+    ++start;
+  }
+  if (str[end] == '/') {
+    --end;
+  }
+  return ret.substr(start, end - start + 1);
+}
 
 //==============================================================================
-// A function to take ros topic names and convert them to valid Zenoh keys.
+// A function that generates a key expression for message transport of the format
+// <ros_domain_id>/<topic_name>/<topic_type>/<topic_hash>
 // In particular, Zenoh keys cannot start or end with a /, so this function
 // will strip them out.
-// The Zenoh key is also prefixed with the ros_domain_id.
 // Performance note: at present, this function allocates a new string and copies
 // the old string into it. If this becomes a performance problem, we could consider
 // modifying the topic_name in place. But this means we need to be much more
 // careful about who owns the string.
-z_owned_keyexpr_t ros_topic_name_to_zenoh_key(const char * const topic_name, size_t domain_id)
+z_owned_keyexpr_t ros_topic_name_to_zenoh_key(
+  const std::size_t domain_id,
+  const char * const topic_name,
+  const char * const topic_type,
+  const char * const type_hash)
 {
-  const std::string keyexpr_str = std::to_string(domain_id) +
-    "/" +
-    rmw_zenoh_cpp::liveliness::mangle_name(topic_name);
+  std::string keyexpr_str = std::to_string(domain_id);
+  keyexpr_str += "/";
+  keyexpr_str += strip_slashes(topic_name);
+  keyexpr_str += "/";
+  keyexpr_str += topic_type;
+  keyexpr_str += "/";
+  keyexpr_str += type_hash;
+
   return z_keyexpr_new(keyexpr_str.c_str());
 }
 
@@ -195,6 +221,10 @@ rmw_create_node(
     context->impl,
     "expected initialized context",
     return nullptr);
+  RMW_CHECK_FOR_NULL_WITH_MSG(
+    context->impl->enclave,
+    "expected initialized enclave",
+    return nullptr);
   if (context->impl->is_shutdown) {
     RCUTILS_SET_ERROR_MSG("context has been shutdown");
     return nullptr;
@@ -279,7 +309,8 @@ rmw_create_node(
     std::to_string(node_data->id),
     std::to_string(node_data->id),
     rmw_zenoh_cpp::liveliness::EntityType::Node,
-    rmw_zenoh_cpp::liveliness::NodeInfo{context->actual_domain_id, namespace_, name, ""});
+    rmw_zenoh_cpp::liveliness::NodeInfo{context->actual_domain_id, namespace_, name,
+      context->impl->enclave});
   if (node_data->entity == nullptr) {
     RCUTILS_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
@@ -470,6 +501,10 @@ rmw_create_publisher(
     context_impl,
     "unable to get rmw_context_impl_s",
     return nullptr);
+  RMW_CHECK_FOR_NULL_WITH_MSG(
+    context_impl->enclave,
+    "expected initialized enclave",
+    return nullptr);
   if (!z_check(context_impl->session)) {
     RMW_SET_ERROR_MSG("zenoh session is invalid");
     return nullptr;
@@ -526,6 +561,7 @@ rmw_create_publisher(
     RMW_ZENOH_DEFAULT_HISTORY_DEPTH;
 
   publisher_data->typesupport_identifier = type_support->typesupport_identifier;
+  publisher_data->type_hash = type_support->get_type_hash_func(type_support);
   publisher_data->type_support_impl = type_support->data;
   auto callbacks = static_cast<const message_type_support_callbacks_t *>(type_support->data);
   publisher_data->type_support = static_cast<rmw_zenoh_cpp::MessageTypeSupport *>(
@@ -567,8 +603,27 @@ rmw_create_publisher(
       allocator->deallocate(const_cast<char *>(rmw_publisher->topic_name), allocator->state);
     });
 
+  // Convert the type hash to a string so that it can be included in
+  // the keyexpr.
+  char * type_hash_c_str = nullptr;
+  rcutils_ret_t stringify_ret = rosidl_stringify_type_hash(
+    publisher_data->type_hash,
+    *allocator,
+    &type_hash_c_str);
+  if (RCUTILS_RET_BAD_ALLOC == stringify_ret) {
+    RMW_SET_ERROR_MSG("Failed to allocate type_hash_c_str.");
+    return nullptr;
+  }
+  auto free_type_hash_c_str = rcpputils::make_scope_exit(
+    [&allocator, &type_hash_c_str]() {
+      allocator->deallocate(type_hash_c_str, allocator->state);
+    });
+
   z_owned_keyexpr_t keyexpr = ros_topic_name_to_zenoh_key(
-    topic_name, node->context->actual_domain_id);
+    node->context->actual_domain_id,
+    topic_name,
+    publisher_data->type_support->get_name(),
+    type_hash_c_str);
   auto always_free_ros_keyexpr = rcpputils::make_scope_exit(
     [&keyexpr]() {
       z_keyexpr_drop(z_move(keyexpr));
@@ -630,9 +685,12 @@ rmw_create_publisher(
       context_impl->get_next_entity_id()),
     rmw_zenoh_cpp::liveliness::EntityType::Publisher,
     rmw_zenoh_cpp::liveliness::NodeInfo{
-      node->context->actual_domain_id, node->namespace_, node->name, ""},
-    rmw_zenoh_cpp::liveliness::TopicInfo{rmw_publisher->topic_name,
-      publisher_data->type_support->get_name(), publisher_data->adapted_qos_profile}
+      node->context->actual_domain_id, node->namespace_, node->name, context_impl->enclave},
+    rmw_zenoh_cpp::liveliness::TopicInfo{
+      rmw_publisher->topic_name,
+      publisher_data->type_support->get_name(),
+      type_hash_c_str,
+      publisher_data->adapted_qos_profile}
   );
   if (publisher_data->entity == nullptr) {
     RCUTILS_LOG_ERROR_NAMED(
@@ -1258,6 +1316,10 @@ rmw_create_subscription(
     context_impl,
     "unable to get rmw_context_impl_s",
     return nullptr);
+  RMW_CHECK_FOR_NULL_WITH_MSG(
+    context_impl->enclave,
+    "expected initialized enclave",
+    return nullptr);
   if (!z_check(context_impl->session)) {
     RMW_SET_ERROR_MSG("zenoh session is invalid");
     return nullptr;
@@ -1312,6 +1374,7 @@ rmw_create_subscription(
     RMW_ZENOH_DEFAULT_HISTORY_DEPTH;
 
   sub_data->typesupport_identifier = type_support->typesupport_identifier;
+  sub_data->type_hash = type_support->get_type_hash_func(type_support);
   sub_data->type_support_impl = type_support->data;
   auto callbacks = static_cast<const message_type_support_callbacks_t *>(type_support->data);
   sub_data->type_support = static_cast<rmw_zenoh_cpp::MessageTypeSupport *>(
@@ -1355,12 +1418,30 @@ rmw_create_subscription(
   rmw_subscription->can_loan_messages = false;
   rmw_subscription->is_cft_enabled = false;
 
+  // Convert the type hash to a string so that it can be included in
+  // the keyexpr.
+  char * type_hash_c_str = nullptr;
+  rcutils_ret_t stringify_ret = rosidl_stringify_type_hash(
+    sub_data->type_hash,
+    *allocator,
+    &type_hash_c_str);
+  if (RCUTILS_RET_BAD_ALLOC == stringify_ret) {
+    RMW_SET_ERROR_MSG("Failed to allocate type_hash_c_str.");
+    return nullptr;
+  }
+  auto free_type_hash_c_str = rcpputils::make_scope_exit(
+    [&allocator, &type_hash_c_str]() {
+      allocator->deallocate(type_hash_c_str, allocator->state);
+    });
+
   // Everything above succeeded and is setup properly.  Now declare a subscriber
   // with Zenoh; after this, callbacks may come in at any time.
-
   z_owned_closure_sample_t callback = z_closure(rmw_zenoh_cpp::sub_data_handler, nullptr, sub_data);
   z_owned_keyexpr_t keyexpr = ros_topic_name_to_zenoh_key(
-    topic_name, node->context->actual_domain_id);
+    node->context->actual_domain_id,
+    topic_name,
+    sub_data->type_support->get_name(),
+    type_hash_c_str);
   auto always_free_ros_keyexpr = rcpputils::make_scope_exit(
     [&keyexpr]() {
       z_keyexpr_drop(z_move(keyexpr));
@@ -1440,9 +1521,12 @@ rmw_create_subscription(
       context_impl->get_next_entity_id()),
     rmw_zenoh_cpp::liveliness::EntityType::Subscription,
     rmw_zenoh_cpp::liveliness::NodeInfo{
-      node->context->actual_domain_id, node->namespace_, node->name, ""},
-    rmw_zenoh_cpp::liveliness::TopicInfo{rmw_subscription->topic_name,
-      sub_data->type_support->get_name(), sub_data->adapted_qos_profile}
+      node->context->actual_domain_id, node->namespace_, node->name, context_impl->enclave},
+    rmw_zenoh_cpp::liveliness::TopicInfo{
+      rmw_subscription->topic_name,
+      sub_data->type_support->get_name(),
+      type_hash_c_str,
+      sub_data->adapted_qos_profile}
   );
   if (sub_data->entity == nullptr) {
     RCUTILS_LOG_ERROR_NAMED(
@@ -1902,6 +1986,10 @@ rmw_create_client(
     context_impl,
     "unable to get rmw_context_impl_s",
     return nullptr);
+  RMW_CHECK_FOR_NULL_WITH_MSG(
+    context_impl->enclave,
+    "expected initialized enclave",
+    return nullptr);
   if (!z_check(context_impl->session)) {
     RMW_SET_ERROR_MSG("zenoh session is invalid");
     return nullptr;
@@ -1990,6 +2078,7 @@ rmw_create_client(
 
   client_data->context = node->context;
   client_data->typesupport_identifier = type_support->typesupport_identifier;
+  client_data->type_hash = type_support->get_type_hash_func(type_support);
   client_data->request_type_support_impl = request_members;
   client_data->response_type_support_impl = response_members;
 
@@ -2055,17 +2144,6 @@ rmw_create_client(
       allocator->deallocate(const_cast<char *>(rmw_client->service_name), allocator->state);
     });
 
-  client_data->keyexpr = ros_topic_name_to_zenoh_key(
-    rmw_client->service_name, node->context->actual_domain_id);
-  auto free_ros_keyexpr = rcpputils::make_scope_exit(
-    [client_data]() {
-      z_keyexpr_drop(z_move(client_data->keyexpr));
-    });
-  if (!z_keyexpr_check(&client_data->keyexpr)) {
-    RMW_SET_ERROR_MSG("unable to create zenoh keyexpr.");
-    return nullptr;
-  }
-
   // Note: Service request/response types will contain a suffix Request_ or Response_.
   // We remove the suffix when appending the type to the liveliness tokens for
   // better reusability within GraphCache.
@@ -2080,6 +2158,37 @@ rmw_create_client(
       service_type.c_str(), rmw_client->service_name);
     return nullptr;
   }
+
+  // Convert the type hash to a string so that it can be included in
+  // the keyexpr.
+  char * type_hash_c_str = nullptr;
+  rcutils_ret_t stringify_ret = rosidl_stringify_type_hash(
+    client_data->type_hash,
+    *allocator,
+    &type_hash_c_str);
+  if (RCUTILS_RET_BAD_ALLOC == stringify_ret) {
+    RMW_SET_ERROR_MSG("Failed to allocate type_hash_c_str.");
+    return nullptr;
+  }
+  auto free_type_hash_c_str = rcpputils::make_scope_exit(
+    [&allocator, &type_hash_c_str]() {
+      allocator->deallocate(type_hash_c_str, allocator->state);
+    });
+
+  client_data->keyexpr = ros_topic_name_to_zenoh_key(
+    node->context->actual_domain_id,
+    rmw_client->service_name,
+    service_type.c_str(),
+    type_hash_c_str);
+  auto free_ros_keyexpr = rcpputils::make_scope_exit(
+    [client_data]() {
+      z_keyexpr_drop(z_move(client_data->keyexpr));
+    });
+  if (!z_keyexpr_check(&client_data->keyexpr)) {
+    RMW_SET_ERROR_MSG("unable to create zenoh keyexpr.");
+    return nullptr;
+  }
+
   client_data->entity = rmw_zenoh_cpp::liveliness::Entity::make(
     z_info_zid(z_loan(node->context->impl->session)),
     std::to_string(node_data->id),
@@ -2087,9 +2196,12 @@ rmw_create_client(
       context_impl->get_next_entity_id()),
     rmw_zenoh_cpp::liveliness::EntityType::Client,
     rmw_zenoh_cpp::liveliness::NodeInfo{
-      node->context->actual_domain_id, node->namespace_, node->name, ""},
-    rmw_zenoh_cpp::liveliness::TopicInfo{rmw_client->service_name,
-      std::move(service_type), client_data->adapted_qos_profile}
+      node->context->actual_domain_id, node->namespace_, node->name, context_impl->enclave},
+    rmw_zenoh_cpp::liveliness::TopicInfo{
+      rmw_client->service_name,
+      std::move(service_type),
+      type_hash_c_str,
+      client_data->adapted_qos_profile}
   );
   if (client_data->entity == nullptr) {
     RCUTILS_LOG_ERROR_NAMED(
@@ -2464,6 +2576,10 @@ rmw_create_service(
     context_impl,
     "unable to get rmw_context_impl_s",
     return nullptr);
+  RMW_CHECK_FOR_NULL_WITH_MSG(
+    context_impl->enclave,
+    "expected initialized enclave",
+    return nullptr);
   if (!z_check(context_impl->session)) {
     RMW_SET_ERROR_MSG("zenoh session is invalid");
     return nullptr;
@@ -2530,6 +2646,7 @@ rmw_create_service(
 
   service_data->context = node->context;
   service_data->typesupport_identifier = type_support->typesupport_identifier;
+  service_data->type_hash = type_support->get_type_hash_func(type_support);
   service_data->request_type_support_impl = request_members;
   service_data->response_type_support_impl = response_members;
 
@@ -2590,8 +2707,43 @@ rmw_create_service(
     [rmw_service, allocator]() {
       allocator->deallocate(const_cast<char *>(rmw_service->service_name), allocator->state);
     });
+
+  // Note: Service request/response types will contain a suffix Request_ or Response_.
+  // We remove the suffix when appending the type to the liveliness tokens for
+  // better reusability within GraphCache.
+  std::string service_type = service_data->response_type_support->get_name();
+  size_t suffix_substring_position = service_type.find("Response_");
+  if (std::string::npos != suffix_substring_position) {
+    service_type = service_type.substr(0, suffix_substring_position);
+  } else {
+    RCUTILS_LOG_ERROR_NAMED(
+      "rmw_zenoh_cpp",
+      "Unexpected type %s for service %s. Report this bug",
+      service_type.c_str(), rmw_service->service_name);
+    return nullptr;
+  }
+
+  // Convert the type hash to a string so that it can be included in
+  // the keyexpr.
+  char * type_hash_c_str = nullptr;
+  rcutils_ret_t stringify_ret = rosidl_stringify_type_hash(
+    service_data->type_hash,
+    *allocator,
+    &type_hash_c_str);
+  if (RCUTILS_RET_BAD_ALLOC == stringify_ret) {
+    RMW_SET_ERROR_MSG("Failed to allocate type_hash_c_str.");
+    return nullptr;
+  }
+  auto free_type_hash_c_str = rcpputils::make_scope_exit(
+    [&allocator, &type_hash_c_str]() {
+      allocator->deallocate(type_hash_c_str, allocator->state);
+    });
+
   service_data->keyexpr = ros_topic_name_to_zenoh_key(
-    rmw_service->service_name, node->context->actual_domain_id);
+    node->context->actual_domain_id,
+    rmw_service->service_name,
+    service_type.c_str(),
+    type_hash_c_str);
   auto free_ros_keyexpr = rcpputils::make_scope_exit(
     [service_data]() {
       if (service_data) {
@@ -2624,20 +2776,6 @@ rmw_create_service(
       z_undeclare_queryable(z_move(service_data->qable));
     });
 
-  // Note: Service request/response types will contain a suffix Request_ or Response_.
-  // We remove the suffix when appending the type to the liveliness tokens for
-  // better reusability within GraphCache.
-  std::string service_type = service_data->response_type_support->get_name();
-  size_t suffix_substring_position = service_type.find("Response_");
-  if (std::string::npos != suffix_substring_position) {
-    service_type = service_type.substr(0, suffix_substring_position);
-  } else {
-    RCUTILS_LOG_ERROR_NAMED(
-      "rmw_zenoh_cpp",
-      "Unexpected type %s for service %s. Report this bug",
-      service_type.c_str(), rmw_service->service_name);
-    return nullptr;
-  }
   service_data->entity = rmw_zenoh_cpp::liveliness::Entity::make(
     z_info_zid(z_loan(node->context->impl->session)),
     std::to_string(node_data->id),
@@ -2645,9 +2783,12 @@ rmw_create_service(
       context_impl->get_next_entity_id()),
     rmw_zenoh_cpp::liveliness::EntityType::Service,
     rmw_zenoh_cpp::liveliness::NodeInfo{
-      node->context->actual_domain_id, node->namespace_, node->name, ""},
-    rmw_zenoh_cpp::liveliness::TopicInfo{rmw_service->service_name,
-      std::move(service_type), service_data->adapted_qos_profile}
+      node->context->actual_domain_id, node->namespace_, node->name, context_impl->enclave},
+    rmw_zenoh_cpp::liveliness::TopicInfo{
+      rmw_service->service_name,
+      std::move(service_type),
+      type_hash_c_str,
+      service_data->adapted_qos_profile}
   );
   if (service_data->entity == nullptr) {
     RCUTILS_LOG_ERROR_NAMED(
@@ -3136,23 +3277,23 @@ rmw_destroy_wait_set(rmw_wait_set_t * wait_set)
   return RMW_RET_OK;
 }
 
-static bool has_triggered_condition(
-  rmw_subscriptions_t * subscriptions,
-  rmw_guard_conditions_t * guard_conditions,
-  rmw_services_t * services,
-  rmw_clients_t * clients,
-  rmw_events_t * events)
+static bool check_and_attach_condition(
+  const rmw_subscriptions_t * const subscriptions,
+  const rmw_guard_conditions_t * const guard_conditions,
+  const rmw_services_t * const services,
+  const rmw_clients_t * const clients,
+  const rmw_events_t * const events,
+  rmw_zenoh_cpp::rmw_wait_set_data_t * wait_set_data)
 {
-  static_cast<void>(events);
-
   if (guard_conditions) {
     for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
       rmw_zenoh_cpp::GuardCondition * gc =
         static_cast<rmw_zenoh_cpp::GuardCondition *>(guard_conditions->guard_conditions[i]);
-      if (gc != nullptr) {
-        if (gc->get_and_reset_trigger()) {
-          return true;
-        }
+      if (gc == nullptr) {
+        continue;
+      }
+      if (gc->check_and_attach_condition_if_not(&wait_set_data->condition_variable)) {
+        return true;
       }
     }
   }
@@ -3160,19 +3301,21 @@ static bool has_triggered_condition(
   if (events) {
     for (size_t i = 0; i < events->event_count; ++i) {
       auto event = static_cast<rmw_event_t *>(events->events[i]);
-      const rmw_event_type_t & event_type = event->event_type;
-      // Check if the event queue for this event type is empty.
-      auto zenoh_event_it = rmw_zenoh_cpp::event_map.find(event_type);
+      auto zenoh_event_it = rmw_zenoh_cpp::event_map.find(event->event_type);
       if (zenoh_event_it != rmw_zenoh_cpp::event_map.end()) {
         auto event_data = static_cast<rmw_zenoh_cpp::EventsManager *>(event->data);
         if (event_data != nullptr) {
-          if (!event_data->event_queue_is_empty(zenoh_event_it->second)) {
+          if (event_data->queue_has_data_and_attach_condition_if_not(
+              zenoh_event_it->second,
+              &wait_set_data->condition_variable))
+          {
             return true;
           }
         }
       } else {
         RMW_SET_ERROR_MSG_WITH_FORMAT_STRING(
-          "has_triggered_condition() called with unknown event %u. Report this bug.", event_type);
+          "has_triggered_condition() called with unknown event %u. Report this bug.",
+          event->event_type);
       }
     }
   }
@@ -3181,10 +3324,13 @@ static bool has_triggered_condition(
     for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
       auto sub_data =
         static_cast<rmw_zenoh_cpp::rmw_subscription_data_t *>(subscriptions->subscribers[i]);
-      if (sub_data != nullptr) {
-        if (!sub_data->message_queue_is_empty()) {
-          return true;
-        }
+      if (sub_data == nullptr) {
+        continue;
+      }
+      if (sub_data->queue_has_data_and_attach_condition_if_not(
+          &wait_set_data->condition_variable))
+      {
+        return true;
       }
     }
   }
@@ -3192,10 +3338,13 @@ static bool has_triggered_condition(
   if (services) {
     for (size_t i = 0; i < services->service_count; ++i) {
       auto serv_data = static_cast<rmw_zenoh_cpp::rmw_service_data_t *>(services->services[i]);
-      if (serv_data != nullptr) {
-        if (!serv_data->query_queue_is_empty()) {
-          return true;
-        }
+      if (serv_data == nullptr) {
+        continue;
+      }
+      if (serv_data->queue_has_data_and_attach_condition_if_not(
+          &wait_set_data->condition_variable))
+      {
+        return true;
       }
     }
   }
@@ -3204,10 +3353,13 @@ static bool has_triggered_condition(
     for (size_t i = 0; i < clients->client_count; ++i) {
       rmw_zenoh_cpp::rmw_client_data_t * client_data =
         static_cast<rmw_zenoh_cpp::rmw_client_data_t *>(clients->clients[i]);
-      if (client_data != nullptr) {
-        if (!client_data->reply_queue_is_empty()) {
-          return true;
-        }
+      if (client_data == nullptr) {
+        continue;
+      }
+      if (client_data->queue_has_data_and_attach_condition_if_not(
+          &wait_set_data->condition_variable))
+      {
+        return true;
       }
     }
   }
@@ -3255,122 +3407,56 @@ rmw_wait(
   // signals to the upper layers that it isn't ready.  If something is ready, then we leave it as
   // a valid pointer.
 
-  bool skip_wait = has_triggered_condition(
-    subscriptions, guard_conditions, services, clients, events);
-  bool wait_result = true;
-
+  bool skip_wait = check_and_attach_condition(
+    subscriptions, guard_conditions, services, clients, events, wait_set_data);
   if (!skip_wait) {
-    if (guard_conditions) {
-      // Attach the wait set condition variable to each guard condition.
-      // That way they can wake it up if they are triggered while we are waiting.
-      for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
-        // This is hard to track down, but each of the (void *) pointers in
-        // guard_conditions->guard_conditions points to the data field of the related
-        // rmw_guard_condition_t.  So we can directly cast it to GuardCondition.
-        rmw_zenoh_cpp::GuardCondition * gc =
-          static_cast<rmw_zenoh_cpp::GuardCondition *>(guard_conditions->guard_conditions[i]);
-        if (gc != nullptr) {
-          gc->attach_condition(&wait_set_data->condition_variable);
-        }
-      }
-    }
-
-    if (subscriptions) {
-      // Attach the wait set condition variable to each subscription.
-      // That way they can wake it up if they are triggered while we are waiting.
-      for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
-        auto sub_data =
-          static_cast<rmw_zenoh_cpp::rmw_subscription_data_t *>(subscriptions->subscribers[i]);
-        if (sub_data != nullptr) {
-          sub_data->attach_condition(&wait_set_data->condition_variable);
-        }
-      }
-    }
-
-    if (services) {
-      // Attach the wait set condition variable to each service.
-      // That way they can wake it up if they are triggered while we are waiting.
-      for (size_t i = 0; i < services->service_count; ++i) {
-        auto serv_data = static_cast<rmw_zenoh_cpp::rmw_service_data_t *>(services->services[i]);
-        if (serv_data != nullptr) {
-          serv_data->attach_condition(&wait_set_data->condition_variable);
-        }
-      }
-    }
-
-    if (clients) {
-      // Attach the wait set condition variable to each client.
-      // That way they can wake it up if they are triggered while we are waiting.
-      for (size_t i = 0; i < clients->client_count; ++i) {
-        rmw_zenoh_cpp::rmw_client_data_t * client_data =
-          static_cast<rmw_zenoh_cpp::rmw_client_data_t *>(clients->clients[i]);
-        if (client_data != nullptr) {
-          client_data->attach_condition(&wait_set_data->condition_variable);
-        }
-      }
-    }
-
-    if (events) {
-      for (size_t i = 0; i < events->event_count; ++i) {
-        auto event = static_cast<rmw_event_t *>(events->events[i]);
-        auto event_data = static_cast<rmw_zenoh_cpp::EventsManager *>(event->data);
-        if (event_data != nullptr) {
-          auto zenoh_event_it = rmw_zenoh_cpp::event_map.find(event->event_type);
-          if (zenoh_event_it != rmw_zenoh_cpp::event_map.end()) {
-            event_data->attach_event_condition(
-              zenoh_event_it->second,
-              &wait_set_data->condition_variable);
-          }
-        }
-      }
-    }
-
     std::unique_lock<std::mutex> lock(wait_set_data->condition_mutex);
 
     // According to the RMW documentation, if wait_timeout is NULL that means
-    // "wait forever", if it specified by 0 it means "never wait", and if it is anything else wait
+    // "wait forever", if it specified as 0 it means "never wait", and if it is anything else wait
     // for that amount of time.
     if (wait_timeout == nullptr) {
       wait_set_data->condition_variable.wait(lock);
     } else {
       if (wait_timeout->sec != 0 || wait_timeout->nsec != 0) {
-        std::cv_status wait_status = wait_set_data->condition_variable.wait_for(
+        wait_set_data->condition_variable.wait_for(
           lock, std::chrono::nanoseconds(wait_timeout->nsec + RCUTILS_S_TO_NS(wait_timeout->sec)));
-        wait_result = wait_status == std::cv_status::no_timeout;
       }
     }
   }
 
+  bool wait_result = false;
+
+  // According to the documentation for rmw_wait in rmw.h, entries in the various arrays that have
+  // *not* been triggered should be set to NULL
   if (guard_conditions) {
-    // Now detach the condition variable and mutex from each of the guard conditions
     for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
       rmw_zenoh_cpp::GuardCondition * gc =
         static_cast<rmw_zenoh_cpp::GuardCondition *>(guard_conditions->guard_conditions[i]);
-      if (gc != nullptr) {
-        gc->detach_condition();
-        // According to the documentation for rmw_wait in rmw.h, entries in the
-        // array that have *not* been triggered should be set to NULL
-        if (!gc->get_and_reset_trigger()) {
-          guard_conditions->guard_conditions[i] = nullptr;
-        }
+      if (gc == nullptr) {
+        continue;
+      }
+      if (!gc->detach_condition_and_trigger_set()) {
+        // Setting to nullptr lets rcl know that this guard condition is not ready
+        guard_conditions->guard_conditions[i] = nullptr;
+      } else {
+        wait_result = true;
       }
     }
   }
 
   if (events) {
-    // Now detach the condition variable and mutex from each of the subscriptions
     for (size_t i = 0; i < events->event_count; ++i) {
       auto event = static_cast<rmw_event_t *>(events->events[i]);
       auto event_data = static_cast<rmw_zenoh_cpp::EventsManager *>(event->data);
       if (event_data != nullptr) {
         auto zenoh_event_it = rmw_zenoh_cpp::event_map.find(event->event_type);
         if (zenoh_event_it != rmw_zenoh_cpp::event_map.end()) {
-          event_data->detach_event_condition(zenoh_event_it->second);
-          // According to the documentation for rmw_wait in rmw.h, entries in the
-          // array that have *not* been triggered should be set to NULL
-          if (event_data->event_queue_is_empty(zenoh_event_it->second)) {
+          if (event_data->detach_condition_and_event_queue_is_empty(zenoh_event_it->second)) {
             // Setting to nullptr lets rcl know that this subscription is not ready
             events->events[i] = nullptr;
+          } else {
+            wait_result = true;
           }
         }
       }
@@ -3378,56 +3464,56 @@ rmw_wait(
   }
 
   if (subscriptions) {
-    // Now detach the condition variable and mutex from each of the subscriptions
     for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
       auto sub_data =
         static_cast<rmw_zenoh_cpp::rmw_subscription_data_t *>(subscriptions->subscribers[i]);
-      if (sub_data != nullptr) {
-        sub_data->detach_condition();
-        // According to the documentation for rmw_wait in rmw.h, entries in the
-        // array that have *not* been triggered should be set to NULL
-        if (sub_data->message_queue_is_empty()) {
-          // Setting to nullptr lets rcl know that this subscription is not ready
-          subscriptions->subscribers[i] = nullptr;
-        }
+      if (sub_data == nullptr) {
+        continue;
+      }
+
+      if (sub_data->detach_condition_and_queue_is_empty()) {
+        // Setting to nullptr lets rcl know that this subscription is not ready
+        subscriptions->subscribers[i] = nullptr;
+      } else {
+        wait_result = true;
       }
     }
   }
 
   if (services) {
-    // Now detach the condition variable and mutex from each of the services
     for (size_t i = 0; i < services->service_count; ++i) {
       auto serv_data = static_cast<rmw_zenoh_cpp::rmw_service_data_t *>(services->services[i]);
-      if (serv_data != nullptr) {
-        serv_data->detach_condition();
-        // According to the documentation for rmw_wait in rmw.h, entries in the
-        // array that have *not* been triggered should be set to NULL
-        if (serv_data->query_queue_is_empty()) {
-          // Setting to nullptr lets rcl know that this service is not ready
-          services->services[i] = nullptr;
-        }
+      if (serv_data == nullptr) {
+        continue;
+      }
+
+      if (serv_data->detach_condition_and_queue_is_empty()) {
+        // Setting to nullptr lets rcl know that this service is not ready
+        services->services[i] = nullptr;
+      } else {
+        wait_result = true;
       }
     }
   }
 
   if (clients) {
-    // Now detach the condition variable and mutex from each of the clients
     for (size_t i = 0; i < clients->client_count; ++i) {
       rmw_zenoh_cpp::rmw_client_data_t * client_data =
         static_cast<rmw_zenoh_cpp::rmw_client_data_t *>(clients->clients[i]);
-      if (client_data != nullptr) {
-        client_data->detach_condition();
-        // According to the documentation for rmw_wait in rmw.h, entries in the
-        // array that have *not* been triggered should be set to NULL
-        if (client_data->reply_queue_is_empty()) {
-          // Setting to nullptr lets rcl know that this client is not ready
-          clients->clients[i] = nullptr;
-        }
+      if (client_data == nullptr) {
+        continue;
+      }
+
+      if (client_data->detach_condition_and_queue_is_empty()) {
+        // Setting to nullptr lets rcl know that this client is not ready
+        clients->clients[i] = nullptr;
+      } else {
+        wait_result = true;
       }
     }
   }
 
-  return (skip_wait || wait_result) ? RMW_RET_OK : RMW_RET_TIMEOUT;
+  return wait_result ? RMW_RET_OK : RMW_RET_TIMEOUT;
 }
 
 //==============================================================================
