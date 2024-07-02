@@ -12,16 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 
 #include "event.hpp"
 
-#include "rcutils/logging_macros.h"
+#include "logging_macros.hpp"
 
 #include "rmw/error_handling.h"
 
+namespace
+{
+// RMW Event types that we support in rmw_zenoh.
+static const std::unordered_map<rmw_event_type_t, rmw_zenoh_cpp::rmw_zenoh_event_type_t> event_map{
+  {RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE, rmw_zenoh_cpp::ZENOH_EVENT_REQUESTED_QOS_INCOMPATIBLE},
+  {RMW_EVENT_OFFERED_QOS_INCOMPATIBLE, rmw_zenoh_cpp::ZENOH_EVENT_OFFERED_QOS_INCOMPATIBLE},
+  {RMW_EVENT_MESSAGE_LOST, rmw_zenoh_cpp::ZENOH_EVENT_MESSAGE_LOST},
+  {RMW_EVENT_SUBSCRIPTION_MATCHED, rmw_zenoh_cpp::ZENOH_EVENT_SUBSCRIPTION_MATCHED},
+  {RMW_EVENT_PUBLICATION_MATCHED, rmw_zenoh_cpp::ZENOH_EVENT_PUBLICATION_MATCHED},
+  {RMW_EVENT_SUBSCRIPTION_INCOMPATIBLE_TYPE,
+    rmw_zenoh_cpp::ZENOH_EVENT_SUBSCRIPTION_INCOMPATIBLE_TYPE},
+  {RMW_EVENT_PUBLISHER_INCOMPATIBLE_TYPE, rmw_zenoh_cpp::ZENOH_EVENT_PUBLISHER_INCOMPATIBLE_TYPE}
+  // TODO(clalancette): Implement remaining events
+};
+}  // namespace
+
 namespace rmw_zenoh_cpp
 {
+rmw_zenoh_event_type_t zenoh_event_from_rmw_event(rmw_event_type_t rmw_event_type)
+{
+  auto zenoh_event_it = event_map.find(rmw_event_type);
+  if (zenoh_event_it != event_map.end()) {
+    return zenoh_event_it->second;
+  }
+
+  return ZENOH_EVENT_INVALID;
+}
+
 ///=============================================================================
 void DataCallbackManager::set_callback(
   const void * user_data, rmw_event_callback_t callback)
@@ -148,7 +178,7 @@ void EventsManager::add_new_event(
     std::deque<std::unique_ptr<rmw_zenoh_event_status_t>> & event_queue = event_queues_[event_id];
     if (event_queue.size() >= event_queue_depth_) {
       // Log warning if message is discarded due to hitting the queue depth
-      RCUTILS_LOG_DEBUG_NAMED(
+      RMW_ZENOH_LOG_DEBUG_NAMED(
         "rmw_zenoh_cpp",
         "Event queue depth of %ld reached, discarding oldest message "
         "for event type %d",

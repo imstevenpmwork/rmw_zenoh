@@ -1,5 +1,4 @@
-// Copyright 2023 Open Source Robotics Foundation, Inc.
-// Copyright 2016-2018 Proyectos y Sistemas de Mantenimiento SL (eProsima).
+// Copyright 2024 Open Source Robotics Foundation, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,34 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef DETAIL__GUARD_CONDITION_HPP_
-#define DETAIL__GUARD_CONDITION_HPP_
+#ifndef DETAIL__LOGGING_HPP_
+#define DETAIL__LOGGING_HPP_
 
-#include <condition_variable>
+#include <rcutils/logging.h>
+
+#include <iostream>
 #include <mutex>
-
-#include "rmw_wait_set_data.hpp"
+#include <string>
+#include <sstream>
 
 namespace rmw_zenoh_cpp
 {
 ///=============================================================================
-class GuardCondition final
+class Logger
 {
 public:
-  GuardCondition();
+  // Get a static reference to the logger.
+  static Logger & get();
 
-  // Sets has_triggered_ to true and calls notify_one() on condition_variable_ if set.
-  void trigger();
+  // Set the threshold log level.
+  void set_log_level(RCUTILS_LOG_SEVERITY new_level);
 
-  bool check_and_attach_condition_if_not(rmw_wait_set_data_t * wait_set_data);
-
-  bool detach_condition_and_is_trigger_set();
+  // Log to the console.
+  void log_named(
+    RCUTILS_LOG_SEVERITY level,
+    const char * name,
+    const char * message,
+    ...) const;
 
 private:
-  mutable std::mutex internal_mutex_;
-  bool has_triggered_;
-  rmw_wait_set_data_t * wait_set_data_;
+  RCUTILS_LOG_SEVERITY threshold_level_;
+  explicit Logger(RCUTILS_LOG_SEVERITY threshold_level);
 };
 }  // namespace rmw_zenoh_cpp
 
-#endif  // DETAIL__GUARD_CONDITION_HPP_
+#endif  // DETAIL__LOGGING_HPP_

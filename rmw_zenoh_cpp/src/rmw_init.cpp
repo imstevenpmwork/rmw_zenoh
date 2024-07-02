@@ -26,7 +26,7 @@
 #include "detail/zenoh_router_check.hpp"
 
 #include "rcutils/env.h"
-#include "rcutils/logging_macros.h"
+#include "detail/logging_macros.hpp"
 #include "rcutils/strdup.h"
 #include "rcutils/types.h"
 
@@ -42,9 +42,10 @@ extern "C"
 // TODO(clalancette): Make this configurable, or get it from the configuration
 #define SHM_BUFFER_SIZE_MB 10
 
-static void graph_sub_data_handler(
-  const z_sample_t * sample,
-  void * data)
+namespace
+{
+void
+graph_sub_data_handler(const z_sample_t * sample, void * data)
 {
   static_cast<void>(data);
 
@@ -58,7 +59,7 @@ static void graph_sub_data_handler(
   rmw_context_impl_s * context_impl = static_cast<rmw_context_impl_s *>(
     data);
   if (context_impl == nullptr) {
-    RCUTILS_LOG_WARN_NAMED(
+    RMW_ZENOH_LOG_WARN_NAMED(
       "rmw_zenoh_cpp",
       "[graph_sub_data_handler] Unable to convert data into context_impl"
     );
@@ -78,12 +79,13 @@ static void graph_sub_data_handler(
 
   rmw_ret_t rmw_ret = rmw_trigger_guard_condition(context_impl->graph_guard_condition);
   if (RMW_RET_OK != rmw_ret) {
-    RCUTILS_LOG_WARN_NAMED(
+    RMW_ZENOH_LOG_WARN_NAMED(
       "rmw_zenoh_cpp",
       "[graph_sub_data_handler] Unable to trigger graph guard condition"
     );
   }
 }
+}  // namespace
 
 //==============================================================================
 /// Initialize the middleware with the given options, and yielding an context.
@@ -153,7 +155,15 @@ rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
     });
 
   // Set the enclave.
-  context->impl->enclave = options->enclave;
+  context->impl->enclave = rcutils_strdup(options->enclave, *allocator);
+  RMW_CHECK_FOR_NULL_WITH_MSG(
+    context->impl->enclave,
+    "failed to allocate enclave",
+    return RMW_RET_BAD_ALLOC);
+  auto free_enclave = rcpputils::make_scope_exit(
+    [context, allocator]() {
+      allocator->deallocate(context->impl->enclave, allocator->state);
+    });
 
   // Initialize context's implementation
   context->impl->is_shutdown = false;
@@ -363,6 +373,7 @@ rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
   impl_destructor.cancel();
   free_guard_condition_data.cancel();
   free_guard_condition.cancel();
+  free_enclave.cancel();
   free_options.cancel();
   impl_destructor.cancel();
   free_impl.cancel();
@@ -433,6 +444,8 @@ rmw_context_fini(rmw_context_t * context)
 
   allocator->deallocate(context->impl->graph_guard_condition, allocator->state);
   context->impl->graph_guard_condition = nullptr;
+
+  allocator->deallocate(context->impl->enclave, allocator->state);
 
   RMW_TRY_DESTRUCTOR(context->impl->~rmw_context_impl_t(), rmw_context_impl_t *, );
 

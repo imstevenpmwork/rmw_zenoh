@@ -33,6 +33,7 @@
 #include "detail/graph_cache.hpp"
 #include "detail/identifier.hpp"
 #include "detail/liveliness_utils.hpp"
+#include "detail/logging_macros.hpp"
 #include "detail/message_type_support.hpp"
 #include "detail/rmw_data_types.hpp"
 #include "detail/serialization_format.hpp"
@@ -41,7 +42,6 @@
 #include "rcpputils/scope_exit.hpp"
 
 #include "rcutils/env.h"
-#include "rcutils/logging_macros.h"
 #include "rcutils/strdup.h"
 #include "rcutils/types.h"
 
@@ -312,7 +312,7 @@ rmw_create_node(
     rmw_zenoh_cpp::liveliness::NodeInfo{context->actual_domain_id, namespace_, name,
       context->impl->enclave});
   if (node_data->entity == nullptr) {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unable to generate keyexpr for liveliness token for the node.");
     return nullptr;
@@ -327,7 +327,7 @@ rmw_create_node(
       z_drop(z_move(node_data->token));
     });
   if (!z_check(node_data->token)) {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unable to create liveliness token for the node.");
     return nullptr;
@@ -416,7 +416,10 @@ rmw_fini_publisher_allocation(
   return RMW_RET_UNSUPPORTED;
 }
 
-static void generate_random_gid(uint8_t gid[RMW_GID_STORAGE_SIZE])
+namespace
+{
+void
+generate_random_gid(uint8_t gid[RMW_GID_STORAGE_SIZE])
 {
   std::random_device dev;
   std::mt19937 rng(dev());
@@ -427,6 +430,7 @@ static void generate_random_gid(uint8_t gid[RMW_GID_STORAGE_SIZE])
     gid[i] = dist(rng);
   }
 }
+}  // namespace
 
 //==============================================================================
 /// Create a publisher and return a handle to that publisher.
@@ -471,14 +475,9 @@ rmw_create_publisher(
       "Strict requirement on unique network flow endpoints for publishers not supported");
     return nullptr;
   }
-  RMW_CHECK_ARGUMENT_FOR_NULL(node->data, nullptr);
   const rmw_zenoh_cpp::rmw_node_data_t * node_data =
     static_cast<rmw_zenoh_cpp::rmw_node_data_t *>(node->data);
-  if (node_data == nullptr) {
-    RMW_SET_ERROR_MSG(
-      "Unable to create publisher as node_data is invalid.");
-    return nullptr;
-  }
+  RMW_CHECK_ARGUMENT_FOR_NULL(node_data, nullptr);
 
   // Get the RMW type support.
   const rosidl_message_type_support_t * type_support = find_message_type_support(type_supports);
@@ -693,7 +692,7 @@ rmw_create_publisher(
       publisher_data->adapted_qos_profile}
   );
   if (publisher_data->entity == nullptr) {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unable to generate keyexpr for liveliness token for the publisher.");
     return nullptr;
@@ -710,12 +709,11 @@ rmw_create_publisher(
       }
     });
   if (!z_check(publisher_data->token)) {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unable to create liveliness token for the publisher.");
     return nullptr;
   }
-  // printf("[rmw_create_publisher] Created pub %s\n", publisher_data->entity->keyexpr().c_str());
 
   free_token.cancel();
   undeclare_z_publisher_cache.cancel();
@@ -845,8 +843,10 @@ rmw_return_loaned_message_from_publisher(
   return RMW_RET_UNSUPPORTED;
 }
 
-static z_owned_bytes_map_t create_map_and_set_sequence_num(
-  int64_t sequence_number, uint8_t gid[RMW_GID_STORAGE_SIZE])
+namespace
+{
+z_owned_bytes_map_t
+create_map_and_set_sequence_num(int64_t sequence_number, uint8_t gid[RMW_GID_STORAGE_SIZE])
 {
   z_owned_bytes_map_t map = z_bytes_map_new();
   if (!z_check(map)) {
@@ -886,6 +886,7 @@ static z_owned_bytes_map_t create_map_and_set_sequence_num(
 
   return map;
 }
+}  // namespace
 
 //==============================================================================
 /// Publish a ROS message.
@@ -1165,8 +1166,21 @@ rmw_get_serialized_message_size(
 rmw_ret_t
 rmw_publisher_assert_liveliness(const rmw_publisher_t * publisher)
 {
-  static_cast<void>(publisher);
-  return RMW_RET_UNSUPPORTED;
+  RMW_CHECK_FOR_NULL_WITH_MSG(
+    publisher, "publisher handle is null",
+    return RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_FOR_NULL_WITH_MSG(
+    publisher->data, "publisher data is null",
+    return RMW_RET_INVALID_ARGUMENT);
+  rmw_zenoh_cpp::rmw_publisher_data_t * pub_data =
+    static_cast<rmw_zenoh_cpp::rmw_publisher_data_t *>(publisher->data);
+  RMW_CHECK_ARGUMENT_FOR_NULL(pub_data, RMW_RET_INVALID_ARGUMENT);
+
+  if (!zc_liveliness_token_check(&pub_data->token)) {
+    return RMW_RET_ERROR;
+  }
+
+  return RMW_RET_OK;
 }
 
 //==============================================================================
@@ -1535,7 +1549,7 @@ rmw_create_subscription(
       sub_data->adapted_qos_profile}
   );
   if (sub_data->entity == nullptr) {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unable to generate keyexpr for liveliness token for the subscription.");
     return nullptr;
@@ -1552,7 +1566,7 @@ rmw_create_subscription(
       }
     });
   if (!z_check(sub_data->token)) {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unable to create liveliness token for the subscription.");
     return nullptr;
@@ -1701,37 +1715,20 @@ rmw_subscription_get_content_filter(
   return RMW_RET_UNSUPPORTED;
 }
 
-static rmw_ret_t __rmw_take(
-  const rmw_subscription_t * subscription,
-  void * ros_message,
-  bool * taken,
-  rmw_message_info_t * message_info)
+namespace
 {
-  RMW_CHECK_ARGUMENT_FOR_NULL(subscription, RMW_RET_INVALID_ARGUMENT);
-  RMW_CHECK_ARGUMENT_FOR_NULL(subscription->topic_name, RMW_RET_ERROR);
-  RMW_CHECK_ARGUMENT_FOR_NULL(subscription->data, RMW_RET_ERROR);
-  RMW_CHECK_ARGUMENT_FOR_NULL(ros_message, RMW_RET_INVALID_ARGUMENT);
-  RMW_CHECK_ARGUMENT_FOR_NULL(taken, RMW_RET_INVALID_ARGUMENT);
-  RMW_CHECK_ARGUMENT_FOR_NULL(message_info, RMW_RET_INVALID_ARGUMENT);
-  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
-    subscription handle,
-    subscription->implementation_identifier, rmw_zenoh_cpp::rmw_zenoh_identifier,
-    return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
-
+rmw_ret_t
+__rmw_take_one(
+  rmw_zenoh_cpp::rmw_subscription_data_t * sub_data,
+  void * ros_message,
+  rmw_message_info_t * message_info,
+  bool * taken)
+{
   *taken = false;
-
-  auto sub_data = static_cast<rmw_zenoh_cpp::rmw_subscription_data_t *>(subscription->data);
-  RMW_CHECK_ARGUMENT_FOR_NULL(sub_data, RMW_RET_INVALID_ARGUMENT);
-
-  if (sub_data->context->impl->is_shutdown) {
-    return RMW_RET_OK;
-  }
-
-  // RETRIEVE SERIALIZED MESSAGE ===============================================
 
   std::unique_ptr<rmw_zenoh_cpp::saved_msg_data> msg_data = sub_data->pop_next_message();
   if (msg_data == nullptr) {
-    // This tells rcl that the check for a new message was done, but no messages have come in yet.
+    // There are no more messages to take.
     return RMW_RET_OK;
   }
 
@@ -1751,19 +1748,22 @@ static rmw_ret_t __rmw_take(
     return RMW_RET_ERROR;
   }
 
-  *taken = true;
+  if (message_info != nullptr) {
+    message_info->source_timestamp = msg_data->source_timestamp;
+    message_info->received_timestamp = msg_data->recv_timestamp;
+    message_info->publication_sequence_number = msg_data->sequence_number;
+    // TODO(clalancette): fill in reception_sequence_number
+    message_info->reception_sequence_number = 0;
+    message_info->publisher_gid.implementation_identifier = rmw_zenoh_cpp::rmw_zenoh_identifier;
+    memcpy(message_info->publisher_gid.data, msg_data->publisher_gid, RMW_GID_STORAGE_SIZE);
+    message_info->from_intra_process = false;
+  }
 
-  message_info->source_timestamp = msg_data->source_timestamp;
-  message_info->received_timestamp = msg_data->recv_timestamp;
-  message_info->publication_sequence_number = msg_data->sequence_number;
-  // TODO(clalancette): fill in reception_sequence_number
-  message_info->reception_sequence_number = 0;
-  message_info->publisher_gid.implementation_identifier = rmw_zenoh_cpp::rmw_zenoh_identifier;
-  memcpy(message_info->publisher_gid.data, msg_data->publisher_gid, RMW_GID_STORAGE_SIZE);
-  message_info->from_intra_process = false;
+  *taken = true;
 
   return RMW_RET_OK;
 }
+}  // namespace
 
 //==============================================================================
 /// Take an incoming ROS message.
@@ -1776,9 +1776,22 @@ rmw_take(
 {
   static_cast<void>(allocation);
 
-  rmw_message_info_t dummy_msg_info;
+  RMW_CHECK_ARGUMENT_FOR_NULL(subscription, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(subscription->topic_name, RMW_RET_ERROR);
+  RMW_CHECK_ARGUMENT_FOR_NULL(subscription->data, RMW_RET_ERROR);
+  RMW_CHECK_ARGUMENT_FOR_NULL(ros_message, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(taken, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    subscription handle,
+    subscription->implementation_identifier, rmw_zenoh_cpp::rmw_zenoh_identifier,
+    return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
-  return __rmw_take(subscription, ros_message, taken, &dummy_msg_info);
+  *taken = false;
+
+  auto sub_data = static_cast<rmw_zenoh_cpp::rmw_subscription_data_t *>(subscription->data);
+  RMW_CHECK_ARGUMENT_FOR_NULL(sub_data, RMW_RET_INVALID_ARGUMENT);
+
+  return __rmw_take_one(sub_data, ros_message, nullptr, taken);
 }
 
 //==============================================================================
@@ -1792,7 +1805,24 @@ rmw_take_with_info(
   rmw_subscription_allocation_t * allocation)
 {
   static_cast<void>(allocation);
-  return __rmw_take(subscription, ros_message, taken, message_info);
+
+  RMW_CHECK_ARGUMENT_FOR_NULL(subscription, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(subscription->topic_name, RMW_RET_ERROR);
+  RMW_CHECK_ARGUMENT_FOR_NULL(subscription->data, RMW_RET_ERROR);
+  RMW_CHECK_ARGUMENT_FOR_NULL(ros_message, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(message_info, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(taken, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    subscription handle,
+    subscription->implementation_identifier, rmw_zenoh_cpp::rmw_zenoh_identifier,
+    return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+
+  *taken = false;
+
+  auto sub_data = static_cast<rmw_zenoh_cpp::rmw_subscription_data_t *>(subscription->data);
+  RMW_CHECK_ARGUMENT_FOR_NULL(sub_data, RMW_RET_INVALID_ARGUMENT);
+
+  return __rmw_take_one(sub_data, ros_message, message_info, taken);
 }
 
 //==============================================================================
@@ -1806,17 +1836,85 @@ rmw_take_sequence(
   size_t * taken,
   rmw_subscription_allocation_t * allocation)
 {
-  static_cast<void>(subscription);
-  static_cast<void>(count);
-  static_cast<void>(message_sequence);
-  static_cast<void>(message_info_sequence);
-  static_cast<void>(taken);
   static_cast<void>(allocation);
-  return RMW_RET_UNSUPPORTED;
+
+  RMW_CHECK_ARGUMENT_FOR_NULL(subscription, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(subscription->topic_name, RMW_RET_ERROR);
+  RMW_CHECK_ARGUMENT_FOR_NULL(subscription->data, RMW_RET_ERROR);
+  RMW_CHECK_ARGUMENT_FOR_NULL(message_sequence, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(message_info_sequence, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(taken, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    subscription handle,
+    subscription->implementation_identifier, rmw_zenoh_cpp::rmw_zenoh_identifier,
+    return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+
+  if (0u == count) {
+    RMW_SET_ERROR_MSG("count cannot be 0");
+    return RMW_RET_INVALID_ARGUMENT;
+  }
+
+  if (count > message_sequence->capacity) {
+    RMW_SET_ERROR_MSG("Insuffient capacity in message_sequence");
+    return RMW_RET_INVALID_ARGUMENT;
+  }
+
+  if (count > message_info_sequence->capacity) {
+    RMW_SET_ERROR_MSG("Insuffient capacity in message_info_sequence");
+    return RMW_RET_INVALID_ARGUMENT;
+  }
+
+  if (count > (std::numeric_limits<uint32_t>::max)()) {
+    RMW_SET_ERROR_MSG_WITH_FORMAT_STRING(
+      "Cannot take %zu samples at once, limit is %" PRIu32,
+      count, (std::numeric_limits<uint32_t>::max)());
+    return RMW_RET_ERROR;
+  }
+
+  *taken = 0;
+
+  auto sub_data = static_cast<rmw_zenoh_cpp::rmw_subscription_data_t *>(subscription->data);
+  RMW_CHECK_ARGUMENT_FOR_NULL(sub_data, RMW_RET_INVALID_ARGUMENT);
+
+  if (sub_data->context->impl->is_shutdown) {
+    return RMW_RET_OK;
+  }
+
+  rmw_ret_t ret;
+
+  while (*taken < count) {
+    bool one_taken = false;
+
+    ret = __rmw_take_one(
+      sub_data, message_sequence->data[*taken],
+      &message_info_sequence->data[*taken], &one_taken);
+    if (ret != RMW_RET_OK) {
+      // If we are taking a sequence and the 2nd take in the sequence failed, we'll report
+      // RMW_RET_ERROR to the caller, but we will *also* tell the caller that there are valid
+      // messages already taken (via the message_sequence size).  It is up to the caller to deal
+      // with that situation appropriately.
+      break;
+    }
+
+    if (!one_taken) {
+      // No error, but there was nothing left to be taken, so break out of the loop
+      break;
+    }
+
+    (*taken)++;
+  }
+
+  message_sequence->size = *taken;
+  message_info_sequence->size = *taken;
+
+  return ret;
 }
 
 //==============================================================================
-static rmw_ret_t __rmw_take_serialized(
+namespace
+{
+rmw_ret_t
+__rmw_take_serialized(
   const rmw_subscription_t * subscription,
   rmw_serialized_message_t * serialized_message,
   bool * taken,
@@ -1864,17 +1962,20 @@ static rmw_ret_t __rmw_take_serialized(
 
   *taken = true;
 
-  message_info->source_timestamp = msg_data->source_timestamp;
-  message_info->received_timestamp = msg_data->recv_timestamp;
-  message_info->publication_sequence_number = msg_data->sequence_number;
-  // TODO(clalancette): fill in reception_sequence_number
-  message_info->reception_sequence_number = 0;
-  message_info->publisher_gid.implementation_identifier = rmw_zenoh_cpp::rmw_zenoh_identifier;
-  memcpy(message_info->publisher_gid.data, msg_data->publisher_gid, RMW_GID_STORAGE_SIZE);
-  message_info->from_intra_process = false;
+  if (message_info != nullptr) {
+    message_info->source_timestamp = msg_data->source_timestamp;
+    message_info->received_timestamp = msg_data->recv_timestamp;
+    message_info->publication_sequence_number = msg_data->sequence_number;
+    // TODO(clalancette): fill in reception_sequence_number
+    message_info->reception_sequence_number = 0;
+    message_info->publisher_gid.implementation_identifier = rmw_zenoh_cpp::rmw_zenoh_identifier;
+    memcpy(message_info->publisher_gid.data, msg_data->publisher_gid, RMW_GID_STORAGE_SIZE);
+    message_info->from_intra_process = false;
+  }
 
   return RMW_RET_OK;
 }
+}  // namespace
 
 //==============================================================================
 /// Take an incoming ROS message as a byte stream.
@@ -1887,9 +1988,7 @@ rmw_take_serialized_message(
 {
   static_cast<void>(allocation);
 
-  rmw_message_info_t dummy_msg_info;
-
-  return __rmw_take_serialized(subscription, serialized_message, taken, &dummy_msg_info);
+  return __rmw_take_serialized(subscription, serialized_message, taken, nullptr);
 }
 
 //==============================================================================
@@ -2158,7 +2257,7 @@ rmw_create_client(
   if (std::string::npos != suffix_substring_position) {
     service_type = service_type.substr(0, suffix_substring_position);
   } else {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unexpected type %s for client %s. Report this bug",
       service_type.c_str(), rmw_client->service_name);
@@ -2210,7 +2309,7 @@ rmw_create_client(
       client_data->adapted_qos_profile}
   );
   if (client_data->entity == nullptr) {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unable to generate keyexpr for liveliness token for the client.");
     return nullptr;
@@ -2227,7 +2326,7 @@ rmw_create_client(
       }
     });
   if (!z_check(client_data->token)) {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unable to create liveliness token for the client.");
     return nullptr;
@@ -2235,6 +2334,7 @@ rmw_create_client(
 
   rmw_client->data = client_data;
 
+  free_token.cancel();
   free_rmw_client.cancel();
   free_client_data.cancel();
   destruct_request_type_support.cancel();
@@ -2432,7 +2532,7 @@ rmw_take_response(
   std::unique_ptr<rmw_zenoh_cpp::ZenohReply> latest_reply = client_data->pop_next_reply();
   if (latest_reply == nullptr) {
     // This tells rcl that the check for a new message was done, but no messages have come in yet.
-    return RMW_RET_ERROR;
+    return RMW_RET_OK;
   }
 
   std::optional<z_sample_t> sample = latest_reply->get_sample();
@@ -2722,7 +2822,7 @@ rmw_create_service(
   if (std::string::npos != suffix_substring_position) {
     service_type = service_type.substr(0, suffix_substring_position);
   } else {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unexpected type %s for service %s. Report this bug",
       service_type.c_str(), rmw_service->service_name);
@@ -2797,7 +2897,7 @@ rmw_create_service(
       service_data->adapted_qos_profile}
   );
   if (service_data->entity == nullptr) {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unable to generate keyexpr for liveliness token for the service.");
     return nullptr;
@@ -2814,7 +2914,7 @@ rmw_create_service(
       }
     });
   if (!z_check(service_data->token)) {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unable to create liveliness token for the service.");
     return nullptr;
@@ -3283,7 +3383,10 @@ rmw_destroy_wait_set(rmw_wait_set_t * wait_set)
   return RMW_RET_OK;
 }
 
-static bool check_and_attach_condition(
+namespace
+{
+bool
+check_and_attach_condition(
   const rmw_subscriptions_t * const subscriptions,
   const rmw_guard_conditions_t * const guard_conditions,
   const rmw_services_t * const services,
@@ -3307,21 +3410,22 @@ static bool check_and_attach_condition(
   if (events) {
     for (size_t i = 0; i < events->event_count; ++i) {
       auto event = static_cast<rmw_event_t *>(events->events[i]);
-      auto zenoh_event_it = rmw_zenoh_cpp::event_map.find(event->event_type);
-      if (zenoh_event_it != rmw_zenoh_cpp::event_map.end()) {
-        auto event_data = static_cast<rmw_zenoh_cpp::EventsManager *>(event->data);
-        if (event_data != nullptr) {
-          if (event_data->queue_has_data_and_attach_condition_if_not(
-              zenoh_event_it->second,
-              wait_set_data))
-          {
-            return true;
-          }
-        }
-      } else {
+      rmw_zenoh_cpp::rmw_zenoh_event_type_t zenoh_event_type =
+        rmw_zenoh_cpp::zenoh_event_from_rmw_event(event->event_type);
+      if (zenoh_event_type == rmw_zenoh_cpp::ZENOH_EVENT_INVALID) {
         RMW_SET_ERROR_MSG_WITH_FORMAT_STRING(
           "has_triggered_condition() called with unknown event %u. Report this bug.",
           event->event_type);
+        continue;
+      }
+
+      auto event_data = static_cast<rmw_zenoh_cpp::EventsManager *>(event->data);
+      if (event_data == nullptr) {
+        continue;
+      }
+
+      if (event_data->queue_has_data_and_attach_condition_if_not(zenoh_event_type, wait_set_data)) {
+        return true;
       }
     }
   }
@@ -3366,6 +3470,7 @@ static bool check_and_attach_condition(
 
   return false;
 }
+}  // namespace
 
 //==============================================================================
 /// Waits on sets of different entities and returns when one is ready.
@@ -3460,16 +3565,21 @@ rmw_wait(
     for (size_t i = 0; i < events->event_count; ++i) {
       auto event = static_cast<rmw_event_t *>(events->events[i]);
       auto event_data = static_cast<rmw_zenoh_cpp::EventsManager *>(event->data);
-      if (event_data != nullptr) {
-        auto zenoh_event_it = rmw_zenoh_cpp::event_map.find(event->event_type);
-        if (zenoh_event_it != rmw_zenoh_cpp::event_map.end()) {
-          if (event_data->detach_condition_and_event_queue_is_empty(zenoh_event_it->second)) {
-            // Setting to nullptr lets rcl know that this subscription is not ready
-            events->events[i] = nullptr;
-          } else {
-            wait_result = true;
-          }
-        }
+      if (event_data == nullptr) {
+        continue;
+      }
+
+      rmw_zenoh_cpp::rmw_zenoh_event_type_t zenoh_event_type =
+        rmw_zenoh_cpp::zenoh_event_from_rmw_event(event->event_type);
+      if (zenoh_event_type == rmw_zenoh_cpp::ZENOH_EVENT_INVALID) {
+        continue;
+      }
+
+      if (event_data->detach_condition_and_event_queue_is_empty(zenoh_event_type)) {
+        // Setting to nullptr lets rcl know that this subscription is not ready
+        events->events[i] = nullptr;
+      } else {
+        wait_result = true;
       }
     }
   }
@@ -3701,6 +3811,7 @@ rmw_get_gid_for_publisher(const rmw_publisher_t * publisher, rmw_gid_t * gid)
 
   rmw_zenoh_cpp::rmw_publisher_data_t * pub_data =
     static_cast<rmw_zenoh_cpp::rmw_publisher_data_t *>(publisher->data);
+  RMW_CHECK_ARGUMENT_FOR_NULL(pub_data, RMW_RET_INVALID_ARGUMENT);
 
   gid->implementation_identifier = rmw_zenoh_cpp::rmw_zenoh_identifier;
   memcpy(gid->data, pub_data->pub_gid, RMW_GID_STORAGE_SIZE);
@@ -3780,7 +3891,7 @@ rmw_service_server_is_available(
   if (std::string::npos != suffix_substring_position) {
     service_type = service_type.substr(0, suffix_substring_position);
   } else {
-    RCUTILS_LOG_ERROR_NAMED(
+    RMW_ZENOH_LOG_ERROR_NAMED(
       "rmw_zenoh_cpp",
       "Unexpected type %s for client %s. Report this bug",
       service_type.c_str(), client->service_name);
@@ -3796,8 +3907,26 @@ rmw_service_server_is_available(
 rmw_ret_t
 rmw_set_log_severity(rmw_log_severity_t severity)
 {
-  static_cast<void>(severity);
-  return RMW_RET_UNSUPPORTED;
+  switch (severity) {
+    case RMW_LOG_SEVERITY_DEBUG:
+      rmw_zenoh_cpp::Logger::get().set_log_level(RCUTILS_LOG_SEVERITY_DEBUG);
+      break;
+    case RMW_LOG_SEVERITY_INFO:
+      rmw_zenoh_cpp::Logger::get().set_log_level(RCUTILS_LOG_SEVERITY_INFO);
+      break;
+    case RMW_LOG_SEVERITY_WARN:
+      rmw_zenoh_cpp::Logger::get().set_log_level(RCUTILS_LOG_SEVERITY_WARN);
+      break;
+    case RMW_LOG_SEVERITY_ERROR:
+      rmw_zenoh_cpp::Logger::get().set_log_level(RCUTILS_LOG_SEVERITY_ERROR);
+      break;
+    case RMW_LOG_SEVERITY_FATAL:
+      rmw_zenoh_cpp::Logger::get().set_log_level(RCUTILS_LOG_SEVERITY_FATAL);
+      break;
+    default:
+      return RMW_RET_UNSUPPORTED;
+  }
+  return RMW_RET_OK;
 }
 
 //==============================================================================
