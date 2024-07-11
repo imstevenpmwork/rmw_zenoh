@@ -35,6 +35,7 @@
 #include "detail/liveliness_utils.hpp"
 #include "detail/logging_macros.hpp"
 #include "detail/message_type_support.hpp"
+#include "detail/qos.hpp"
 #include "detail/rmw_data_types.hpp"
 #include "detail/serialization_format.hpp"
 #include "detail/type_support_common.hpp"
@@ -54,18 +55,6 @@
 #include "rmw/rmw.h"
 #include "rmw/validate_namespace.h"
 #include "rmw/validate_node_name.h"
-
-#include "rmw_dds_common/qos.hpp"
-
-// If the depth field in the qos profile is set to 0, the RMW implementation
-// has the liberty to assign a default depth. The zenoh transport protocol
-// is configured with 256 channels so theoretically, this would be the maximum
-// depth we can set before blocking transport. A high depth would increase the
-// memory footprint of processes as more messages are stored in memory while a
-// very low depth might unintentionally drop messages leading to a poor
-// out-of-the-box experience for new users. For now we set the depth to 42,
-// a popular "magic number". See https://en.wikipedia.org/wiki/42_(number).
-#define RMW_ZENOH_DEFAULT_HISTORY_DEPTH 42;
 
 namespace
 {
@@ -548,16 +537,11 @@ rmw_create_publisher(
 
   // Adapt any 'best available' QoS options
   publisher_data->adapted_qos_profile = *qos_profile;
-  rmw_ret_t ret = rmw_dds_common::qos_profile_get_best_available_for_topic_publisher(
+  rmw_ret_t ret = rmw_zenoh_cpp::QoS::get().best_available_qos(
     node, topic_name, &publisher_data->adapted_qos_profile, rmw_get_subscriptions_info_by_topic);
   if (RMW_RET_OK != ret) {
     return nullptr;
   }
-  // If a depth of 0 was provided, the RMW implementation should choose a suitable default.
-  publisher_data->adapted_qos_profile.depth =
-    publisher_data->adapted_qos_profile.depth > 0 ?
-    publisher_data->adapted_qos_profile.depth :
-    RMW_ZENOH_DEFAULT_HISTORY_DEPTH;
 
   publisher_data->typesupport_identifier = type_support->typesupport_identifier;
   publisher_data->type_hash = type_support->get_type_hash_func(type_support);
@@ -1381,17 +1365,12 @@ rmw_create_subscription(
 
   // Adapt any 'best available' QoS options
   sub_data->adapted_qos_profile = *qos_profile;
-  rmw_ret_t ret = rmw_dds_common::qos_profile_get_best_available_for_topic_subscription(
+  rmw_ret_t ret = rmw_zenoh_cpp::QoS::get().best_available_qos(
     node, topic_name, &sub_data->adapted_qos_profile, rmw_get_publishers_info_by_topic);
   if (RMW_RET_OK != ret) {
     RMW_SET_ERROR_MSG("Failed to obtain adapted_qos_profile.");
     return nullptr;
   }
-  // If a depth of 0 was provided, the RMW implementation should choose a suitable default.
-  sub_data->adapted_qos_profile.depth =
-    sub_data->adapted_qos_profile.depth > 0 ?
-    sub_data->adapted_qos_profile.depth :
-    RMW_ZENOH_DEFAULT_HISTORY_DEPTH;
 
   sub_data->typesupport_identifier = type_support->typesupport_identifier;
   sub_data->type_hash = type_support->get_type_hash_func(type_support);
@@ -2160,13 +2139,13 @@ rmw_create_client(
   generate_random_gid(client_data->client_gid);
 
   // Adapt any 'best available' QoS options
-  client_data->adapted_qos_profile =
-    rmw_dds_common::qos_profile_update_best_available_for_services(*qos_profile);
-  // If a depth of 0 was provided, the RMW implementation should choose a suitable default.
-  client_data->adapted_qos_profile.depth =
-    client_data->adapted_qos_profile.depth > 0 ?
-    client_data->adapted_qos_profile.depth :
-    RMW_ZENOH_DEFAULT_HISTORY_DEPTH;
+  client_data->adapted_qos_profile = *qos_profile;
+  rmw_ret_t ret = rmw_zenoh_cpp::QoS::get().best_available_qos(
+    nullptr, nullptr, &client_data->adapted_qos_profile, nullptr);
+  if (RMW_RET_OK != ret) {
+    RMW_SET_ERROR_MSG("Failed to obtain adapted_qos_profile.");
+    return nullptr;
+  }
 
   // Obtain the type support
   const rosidl_service_type_support_t * type_support = find_service_type_support(type_supports);
@@ -2378,7 +2357,6 @@ rmw_destroy_client(rmw_node_t * node, rmw_client_t * client)
     return RMW_RET_INVALID_ARGUMENT);
 
   // CLEANUP ===================================================================
-  z_drop(z_move(client_data->zn_closure_reply));
   z_drop(z_move(client_data->keyexpr));
   zc_liveliness_undeclare_token(z_move(client_data->token));
 
@@ -2390,9 +2368,13 @@ rmw_destroy_client(rmw_node_t * node, rmw_client_t * client)
     client_data->response_type_support->~ResponseTypeSupport(), rmw_zenoh_cpp::ResponseTypeSupport,
   );
   allocator->deallocate(client_data->response_type_support, allocator->state);
-  RMW_TRY_DESTRUCTOR(client_data->~rmw_client_data_t(), rmw_client_data_t, );
 
-  allocator->deallocate(client->data, allocator->state);
+  // See the comment about the "num_in_flight" class variable in the rmw_client_data_t class for
+  // why we need to do this.
+  if (!client_data->shutdown_and_query_in_flight()) {
+    RMW_TRY_DESTRUCTOR(client_data->~rmw_client_data_t(), rmw_client_data_t, );
+    allocator->deallocate(client->data, allocator->state);
+  }
 
   allocator->deallocate(const_cast<char *>(client->service_name), allocator->state);
   allocator->deallocate(client, allocator->state);
@@ -2424,6 +2406,10 @@ rmw_send_request(
     client_data,
     "Unable to retrieve client_data from client.",
     RMW_RET_INVALID_ARGUMENT);
+
+  if (client_data->is_shutdown()) {
+    return RMW_RET_ERROR;
+  }
 
   rmw_context_impl_s * context_impl = static_cast<rmw_context_impl_s *>(
     client_data->context->impl);
@@ -2479,6 +2465,10 @@ rmw_send_request(
       z_bytes_map_drop(z_move(map));
     });
 
+  // See the comment about the "num_in_flight" class variable in the rmw_client_data_t class for
+  // why we need to do this.
+  client_data->increment_in_flight_callbacks();
+
   opts.attachment = z_bytes_map_as_attachment(&map);
 
   opts.target = Z_QUERY_TARGET_ALL_COMPLETE;
@@ -2492,11 +2482,13 @@ rmw_send_request(
   // and any number.
   opts.consolidation = z_query_consolidation_latest();
   opts.value.payload = z_bytes_t{data_length, reinterpret_cast<const uint8_t *>(request_bytes)};
-  client_data->zn_closure_reply =
-    z_closure(rmw_zenoh_cpp::client_data_handler, nullptr, client_data);
+  z_owned_closure_reply_t zn_closure_reply =
+    z_closure(rmw_zenoh_cpp::client_data_handler, rmw_zenoh_cpp::client_data_drop, client_data);
   z_get(
-    z_loan(context_impl->session), z_loan(
-      client_data->keyexpr), "", &client_data->zn_closure_reply, &opts);
+    z_loan(context_impl->session),
+    z_loan(client_data->keyexpr), "",
+    z_move(zn_closure_reply),
+    &opts);
 
   return RMW_RET_OK;
 }
@@ -2631,7 +2623,7 @@ rmw_create_service(
   const rmw_node_t * node,
   const rosidl_service_type_support_t * type_supports,
   const char * service_name,
-  const rmw_qos_profile_t * qos_profiles)
+  const rmw_qos_profile_t * qos_profile)
 {
   // ASSERTIONS ================================================================
   RMW_CHECK_ARGUMENT_FOR_NULL(node, nullptr);
@@ -2646,8 +2638,8 @@ rmw_create_service(
     RMW_SET_ERROR_MSG("service_name argument is an empty string");
     return nullptr;
   }
-  RMW_CHECK_ARGUMENT_FOR_NULL(qos_profiles, nullptr);
-  if (!qos_profiles->avoid_ros_namespace_conventions) {
+  RMW_CHECK_ARGUMENT_FOR_NULL(qos_profile, nullptr);
+  if (!qos_profile->avoid_ros_namespace_conventions) {
     int validation_result = RMW_TOPIC_VALID;
     // TODO(francocipollone): Verify if this is the right way to validate the service name.
     rmw_ret_t ret = rmw_validate_full_topic_name(service_name, &validation_result, nullptr);
@@ -2729,13 +2721,13 @@ rmw_create_service(
     });
 
   // Adapt any 'best available' QoS options
-  service_data->adapted_qos_profile =
-    rmw_dds_common::qos_profile_update_best_available_for_services(*qos_profiles);
-  // If a depth of 0 was provided, the RMW implementation should choose a suitable default.
-  service_data->adapted_qos_profile.depth =
-    service_data->adapted_qos_profile.depth > 0 ?
-    service_data->adapted_qos_profile.depth :
-    RMW_ZENOH_DEFAULT_HISTORY_DEPTH;
+  service_data->adapted_qos_profile = *qos_profile;
+  rmw_ret_t ret = rmw_zenoh_cpp::QoS::get().best_available_qos(
+    nullptr, nullptr, &service_data->adapted_qos_profile, nullptr);
+  if (RMW_RET_OK != ret) {
+    RMW_SET_ERROR_MSG("Failed to obtain adapted_qos_profile.");
+    return nullptr;
+  }
 
   // Get the RMW type support.
   const rosidl_service_type_support_t * type_support = find_service_type_support(type_supports);

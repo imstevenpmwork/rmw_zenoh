@@ -26,7 +26,6 @@ find_package(rcutils REQUIRED)
 find_package(rosidl_typesupport_fastrtps_c REQUIRED)
 find_package(rosidl_typesupport_fastrtps_cpp REQUIRED)
 find_package(rmw REQUIRED)
-find_package(rmw_dds_common REQUIRED)
 find_package(zenoh_c_vendor REQUIRED)
 
 add_library(rmw_zenoh_cpp SHARED
@@ -39,6 +38,7 @@ add_library(rmw_zenoh_cpp SHARED
   src/detail/liveliness_utils.cpp
   src/detail/logging.cpp
   src/detail/message_type_support.cpp
+  src/detail/qos.cpp
   src/detail/rmw_data_types.cpp
   src/detail/service_type_support.cpp
   src/detail/type_support.cpp
@@ -66,7 +66,6 @@ target_link_libraries(rmw_zenoh_cpp
     rosidl_typesupport_fastrtps_c::rosidl_typesupport_fastrtps_c
     rosidl_typesupport_fastrtps_cpp::rosidl_typesupport_fastrtps_cpp
     rmw::rmw
-    rmw_dds_common::rmw_dds_common_library
     zenohc::lib
 )
 
